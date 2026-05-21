@@ -281,10 +281,91 @@ if modo_analise == "Análise de Rota":
                             st.bar_chart(dados_rota['causa_acidente'].value_counts().head(5))
 
 elif modo_analise == "Análise Geral PE":
-    st.subheader("Em construção")
+    st.subheader("📊 Análise Geral - Pernambuco")
+    
+    # 1. Métricas Principais (KPIs)
+    total_acidentes = len(df)
+    total_mortos = df['mortos'].sum()
+    total_feridos = df['feridos'].sum()
+    total_veiculos = df['veiculos'].sum()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total de Acidentes", total_acidentes)
+    col2.metric("Total de Mortos", total_mortos, delta=None, delta_color="inverse")
+    col3.metric("Total de Feridos", total_feridos)
+    col4.metric("Veículos Envolvidos", total_veiculos)
+    
+    st.write("---")
+    
+    # 2. Distribuição Temporal e Espacial
+    col_temp, col_city = st.columns(2)
+    
+    with col_temp:
+        st.write("**Acidentes por Hora do Dia**")
+        hist_hora = df['horario_hora'].value_counts().sort_index()
+        st.bar_chart(hist_hora)
+        
+        st.write("**Acidentes por Dia da Semana**")
+        # Ordenando dias da semana logicamente
+        dias_ordem = ['segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
+        hist_semana = df['dia_semana'].value_counts().reindex(dias_ordem)
+        st.bar_chart(hist_semana)
+
+    with col_city:
+        st.write("**Top 10 Municípios com Mais Acidentes**")
+        top_cidades = df['municipio'].value_counts().head(10)
+        st.bar_chart(top_cidades)
+        
+        st.write("**Classificação dos Acidentes**")
+        classificacao = df['classificacao_acidente'].value_counts()
+        st.bar_chart(classificacao)
+
+    st.write("---")
+    
+    # 3. Causas e Tipos
+    col_causa, col_tipo = st.columns(2)
+    
+    with col_causa:
+        st.write("**Top 10 Causas de Acidentes**")
+        top_causas = df['causa_acidente'].value_counts().head(10)
+        st.bar_chart(top_causas)
+        
+    with col_tipo:
+        st.write("**Top 10 Tipos de Acidentes**")
+        top_tipos = df['tipo_acidente'].value_counts().head(10)
+        st.bar_chart(top_tipos)
+
+    # 4. Mapa de Calor do Estado
+    st.write("---")
+    st.write("**Distribuição Geográfica de Acidentes (PE)**")
+    
+    # Amostragem para não travar o mapa se houver muitos dados
+    if len(df) > 2000:
+        df_mapa = df.sample(2000)
+        st.caption("Exibindo amostra de 2.000 registros para otimização de performance.")
+    else:
+        df_mapa = df
+        
+    m_geral = folium.Map(location=[-8.3, -37.8], zoom_start=7)
+    
+    # Cluster de marcadores para visão geral
+    from folium.plugins import MarkerCluster
+    marker_cluster = MarkerCluster().add_to(m_geral)
+    
+    for _, row in df_mapa.iterrows():
+        folium.CircleMarker(
+            [row['latitude'], row['longitude']],
+            radius=3,
+            color='red',
+            fill=True,
+            popup=f"{row['municipio']} - {row['tipo_acidente']}"
+        ).add_to(marker_cluster)
+        
+    st_folium(m_geral, width=1000, height=500, key="mapa_geral_pe")
 
 elif modo_analise == "Comparativo Anual":
-    st.subheader("Em construção")
+    st.subheader("🚧 Em construção")
+    st.info("Esta funcionalidade permitirá comparar estatísticas entre diferentes anos em breve.")
 
 # Rodapé Informativo
 st.sidebar.markdown("---")
