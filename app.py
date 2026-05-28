@@ -3,44 +3,8 @@ import pandas as pd
 import sqlite3
 import os
 import folium
-import requests
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
-
-# --- FUNÇÕES ADICIONAIS ---
-
-@st.cache_data(ttl=3600)  # Cache de 1 hora para não sobrecarregar a API
-def buscar_postos_gasolina(lat_min, lon_min, lat_max, lon_max):
-    """Busca postos de gasolina no OpenStreetMap via Overpass API."""
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    
-    # Adicionando uma margem maior (aprox 5km) para garantir a captura
-    margin = 0.05 
-    
-    # Ordenando lat/lon para garantir que a query receba (min, min, max, max)
-    s, n = min(lat_min, lat_max) - margin, max(lat_min, lat_max) + margin
-    w, e = min(lon_min, lon_max) - margin, max(lon_min, lon_max) + margin
-
-    query = f"""
-    [out:json][timeout:25];
-    node["amenity"="fuel"]({s},{w},{n},{e});
-    out body;
-    """
-    
-    headers = {
-        'User-Agent': 'FluxAccidentAnalysis/1.0 (Streamlit App)'
-    }
-    
-    try:
-        response = requests.get(overpass_url, params={'data': query}, headers=headers, timeout=20)
-        if response.status_code == 200:
-            return response.json().get('elements', [])
-        else:
-            return f"Erro API: {response.status_code}"
-    except Exception as e:
-        return f"Erro de conexão: {e}"
-
-# Configurações da Página
-st.set_page_config(page_title="Flux - Análise de Acidentes", layout="wide", page_icon="🚗")
 
 # --- 1. FUNÇÕES DE BANCO DE DADOS ---
 
@@ -51,7 +15,7 @@ def get_connection():
 
 def criar_banco_se_nao_existir(force_update=False):
     """
-    Carrega os CSVs, padroniza, combina e insere no SQLite.
+    Carrega os CSVs, padroniza, combina e insere no SQLite com índices.
     Só roda se o banco não existir ou se force_update=True.
     """
     if os.path.exists("data/acidentes.db") and not force_update:
@@ -84,6 +48,11 @@ def criar_banco_se_nao_existir(force_update=False):
             for col in ['latitude', 'longitude', 'km', 'br']:
                 df_temp[col] = pd.to_numeric(df_temp[col].astype(str).str.replace(',', '.'), errors='coerce')
             
+            # Garantir que feridos e mortos são numéricos
+            for col in ['mortos', 'feridos_graves', 'feridos_leves', 'feridos']:
+                if col in df_temp.columns:
+                    df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce').fillna(0)
+            
             # Remover coordenadas nulas para o funcionamento do mapa
             df_temp = df_temp.dropna(subset=['latitude', 'longitude'])
             
@@ -104,11 +73,21 @@ def criar_banco_se_nao_existir(force_update=False):
         conn = get_connection()
         # Salva no banco de dados (substitui se existir)
         df_final.to_sql("acidentes", conn, if_exists="replace", index=False)
+        
+        # Criar índices para performance
+        status_text.text("Otimizando consultas (criando índices)...")
+        cursor = conn.cursor()
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_uf_ano ON acidentes(uf, ano)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_br_km ON acidentes(br, km)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_municipio ON acidentes(municipio)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_causa ON acidentes(causa_acidente)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tipo ON acidentes(tipo_acidente)")
+        conn.commit()
         conn.close()
         
-        status_text.text("Banco de dados pronto!")
+        status_text.text("Banco de dados pronto e otimizado!")
         progress_bar.empty()
-        st.sidebar.success("Dados carregados com sucesso!")
+        st.sidebar.success("Dados carregados e otimizados com sucesso!")
     else:
         st.error("Não foi possível carregar nenhum dado para o banco.")
 
@@ -125,6 +104,11 @@ def consultar_dados(query):
             df['horario_hora'] = pd.to_datetime(df['horario'], format='%H:%M:%S', errors='coerce').dt.hour
             df = df.dropna(subset=['horario_hora'])
             df['horario_hora'] = df['horario_hora'].astype(int)
+        
+        # Formatação de colunas de texto para melhor visualização
+        for col in ['causa_acidente', 'tipo_acidente', 'classificacao_acidente', 'condicao_metereologica', 'fase_dia']:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace('_', ' ').str.title().replace('Nan', pd.NA)
             
         return df
     except Exception as e:
@@ -145,7 +129,7 @@ criar_banco_se_nao_existir()
 
 # Filtros Globais carregados do banco
 try:
-    anos_disponiveis = sorted(consultar_dados("SELECT DISTINCT ano FROM acidentes")['ano'].tolist())
+    anos_disponiveis = sorted(consultar_dados("SELECT DISTINCT ano FROM acidentes")['ano'].dropna().tolist())
 except:
     anos_disponiveis = []
 
@@ -155,9 +139,28 @@ if not anos_disponiveis:
 
 filtro_ano = st.sidebar.multiselect("Selecione os Anos", options=anos_disponiveis, default=anos_disponiveis)
 
-# Query dinâmica baseada nos anos selecionados (filtrando Pernambuco por padrão como no original)
+# Filtros Avançados
+st.sidebar.subheader("🎯 Filtros Avançados")
+todas_causas = sorted(consultar_dados("SELECT DISTINCT causa_acidente FROM acidentes")['causa_acidente'].dropna().unique())
+filtro_causa = st.sidebar.multiselect("Causa do Acidente", options=todas_causas)
+
+todos_tipos = sorted(consultar_dados("SELECT DISTINCT tipo_acidente FROM acidentes")['tipo_acidente'].dropna().unique())
+filtro_tipo = st.sidebar.multiselect("Tipo de Acidente", options=todos_tipos)
+
+todas_classes = sorted(consultar_dados("SELECT DISTINCT classificacao_acidente FROM acidentes")['classificacao_acidente'].dropna().unique())
+filtro_classe = st.sidebar.multiselect("Classificação", options=todas_classes)
+
+# Query dinâmica baseada nos anos e filtros selecionados
 query_base = f"SELECT * FROM acidentes WHERE uf = 'PE' AND ano IN ({','.join(map(str, filtro_ano))})"
 df = consultar_dados(query_base)
+
+# Aplicar filtros avançados no DataFrame em memória (mais rápido que nova query SQL complexa para multiselects vazios)
+if filtro_causa:
+    df = df[df['causa_acidente'].isin(filtro_causa)]
+if filtro_tipo:
+    df = df[df['tipo_acidente'].isin(filtro_tipo)]
+if filtro_classe:
+    df = df[df['classificacao_acidente'].isin(filtro_classe)]
 
 if df.empty:
     st.info("Nenhum dado encontrado para os filtros selecionados.")
@@ -173,7 +176,7 @@ modo_analise = st.sidebar.radio("Selecione o Modo de Análise", menu)
 if modo_analise == "Análise de Rota":
     st.subheader("📍 Análise de Pontos Críticos por Rota")
     
-    cidades_pe = sorted(df['municipio'].unique())
+    cidades_pe = sorted(df['municipio'].dropna().unique())
     
     col_orig, col_dest = st.sidebar.columns(2)
     origem = col_orig.selectbox("Origem", cidades_pe, index=cidades_pe.index("RECIFE") if "RECIFE" in cidades_pe else 0)
@@ -245,40 +248,42 @@ if modo_analise == "Análise de Rota":
                                 popup=f"KM {row['km']} | {row['tipo_acidente']}"
                             ).add_to(m)
                         
-                        # Buscar e Adicionar Postos de Gasolina (Azul)
-                        lat_min, lat_max = dados_rota['latitude'].min(), dados_rota['latitude'].max()
-                        lon_min, lon_max = dados_rota['longitude'].min(), dados_rota['longitude'].max()
-                        
-                        resultado_postos = buscar_postos_gasolina(lat_min, lon_min, lat_max, lon_max)
-                        
-                        if isinstance(resultado_postos, list):
-                            for posto in resultado_postos:
-                                nome_posto = posto.get('tags', {}).get('name', 'Posto de Gasolina')
-                                folium.Marker(
-                                    [posto['lat'], posto['lon']],
-                                    popup=nome_posto,
-                                    icon=folium.Icon(color='blue', icon='info-sign')
-                                ).add_to(m)
-                            
-                            if resultado_postos:
-                                st.caption(f"ℹ️ Foram encontrados {len(resultado_postos)} postos de gasolina próximos ao trecho.")
-                            else:
-                                st.caption("ℹ️ Nenhum posto de gasolina mapeado nesta região específica.")
-                        else:
-                            st.warning(f"⚠️ Não foi possível carregar os postos: {resultado_postos}")
-                        
                         # Adicionando uma chave única para evitar problemas de recarregamento
                         st_folium(m, width=1000, height=450, key=f"mapa_{origem}_{destino}")
                         
+                        # Cálculo de Gravidade e Pontos Negros
+                        dados_rota['gravidade'] = (dados_rota['mortos'] * 10) + \
+                                                  (dados_rota['feridos_graves'] * 5) + \
+                                                  (dados_rota['feridos_leves'] * 2)
+                        
+                        st.write("---")
+                        col_stats, col_perigo = st.columns([1, 1])
+                        
+                        with col_stats:
+                            st.write("**🔥 Trechos Mais Críticos (Pontos Negros)**")
+                            # Agrupar por KM arredondado para identificar áreas de concentração
+                            pontos_negros = dados_rota.groupby('km').agg({
+                                'id': 'count',
+                                'gravidade': 'sum'
+                            }).rename(columns={'id': 'Qtd Acidentes', 'gravidade': 'Gravidade Total'}).sort_values('Gravidade Total', ascending=False).head(5)
+                            st.table(pontos_negros)
+
+                        with col_perigo:
+                            st.write("**⚠️ Fatores de Risco no Trecho**")
+                            pior_clima = dados_rota['condicao_metereologica'].mode()[0]
+                            pior_fase = dados_rota['fase_dia'].mode()[0]
+                            st.warning(f"**Clima Predominante em Acidentes:** {pior_clima}")
+                            st.warning(f"**Fase do Dia Mais Perigosa:** {pior_fase}")
+
                         # Gráficos de apoio
                         st.write("---")
                         col_g1, col_g2 = st.columns(2)
                         with col_g1:
                             st.write("**Acidentes por Hora (Rota)**")
-                            st.bar_chart(dados_rota['horario_hora'].value_counts().sort_index())
+                            st.bar_chart(dados_rota['horario_hora'].value_counts().sort_index().rename_axis("Hora").rename("Qtd Acidentes"))
                         with col_g2:
                             st.write("**Top 5 Causas (Rota)**")
-                            st.bar_chart(dados_rota['causa_acidente'].value_counts().head(5))
+                            st.bar_chart(dados_rota['causa_acidente'].value_counts().head(5).rename_axis("Causa").rename("Qtd Acidentes"))
 
 elif modo_analise == "Análise Geral PE":
     st.subheader("📊 Análise Geral - Pernambuco")
@@ -302,22 +307,22 @@ elif modo_analise == "Análise Geral PE":
     
     with col_temp:
         st.write("**Acidentes por Hora do Dia**")
-        hist_hora = df['horario_hora'].value_counts().sort_index()
+        hist_hora = df['horario_hora'].value_counts().sort_index().rename_axis("Hora").rename("Qtd Acidentes")
         st.bar_chart(hist_hora)
         
         st.write("**Acidentes por Dia da Semana**")
         # Ordenando dias da semana logicamente
-        dias_ordem = ['segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
-        hist_semana = df['dia_semana'].value_counts().reindex(dias_ordem)
+        dias_ordem = ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira', 'Quinta-Feira', 'Sexta-Feira', 'Sábado', 'Domingo']
+        hist_semana = df['dia_semana'].value_counts().reindex(dias_ordem).rename_axis("Dia da Semana").rename("Qtd Acidentes")
         st.bar_chart(hist_semana)
 
     with col_city:
         st.write("**Top 10 Municípios com Mais Acidentes**")
-        top_cidades = df['municipio'].value_counts().head(10)
+        top_cidades = df['municipio'].value_counts().head(10).rename_axis("Município").rename("Qtd Acidentes")
         st.bar_chart(top_cidades)
         
         st.write("**Classificação dos Acidentes**")
-        classificacao = df['classificacao_acidente'].value_counts()
+        classificacao = df['classificacao_acidente'].value_counts().rename_axis("Classificação").rename("Qtd Acidentes")
         st.bar_chart(classificacao)
 
     st.write("---")
@@ -327,45 +332,61 @@ elif modo_analise == "Análise Geral PE":
     
     with col_causa:
         st.write("**Top 10 Causas de Acidentes**")
-        top_causas = df['causa_acidente'].value_counts().head(10)
+        top_causas = df['causa_acidente'].value_counts().head(10).rename_axis("Causa").rename("Qtd Acidentes")
         st.bar_chart(top_causas)
         
     with col_tipo:
         st.write("**Top 10 Tipos de Acidentes**")
-        top_tipos = df['tipo_acidente'].value_counts().head(10)
+        top_tipos = df['tipo_acidente'].value_counts().head(10).rename_axis("Tipo").rename("Qtd Acidentes")
         st.bar_chart(top_tipos)
 
     # 4. Mapa de Calor do Estado
     st.write("---")
-    st.write("**Distribuição Geográfica de Acidentes (PE)**")
+    st.write("**Mapa de Calor de Acidentes (PE)**")
     
-    # Amostragem para não travar o mapa se houver muitos dados
-    if len(df) > 2000:
-        df_mapa = df.sample(2000)
-        st.caption("Exibindo amostra de 2.000 registros para otimização de performance.")
-    else:
-        df_mapa = df
-        
+    # Amostragem para performance
+    df_mapa = df.sample(min(3000, len(df)))
+    
     m_geral = folium.Map(location=[-8.3, -37.8], zoom_start=7)
     
-    # Cluster de marcadores para visão geral
-    from folium.plugins import MarkerCluster
-    marker_cluster = MarkerCluster().add_to(m_geral)
+    # Preparar dados para o HeatMap: [[lat, lon, peso], ...]
+    heat_data = [[row['latitude'], row['longitude']] for _, row in df_mapa.iterrows()]
     
-    for _, row in df_mapa.iterrows():
-        folium.CircleMarker(
-            [row['latitude'], row['longitude']],
-            radius=3,
-            color='red',
-            fill=True,
-            popup=f"{row['municipio']} - {row['tipo_acidente']}"
-        ).add_to(marker_cluster)
+    HeatMap(heat_data, radius=10, blur=15, min_opacity=0.5).add_to(m_geral)
         
     st_folium(m_geral, width=1000, height=500, key="mapa_geral_pe")
 
 elif modo_analise == "Comparativo Anual":
-    st.subheader("🚧 Em construção")
-    st.info("Esta funcionalidade permitirá comparar estatísticas entre diferentes anos em breve.")
+    st.subheader("📈 Comparativo Anual")
+    
+    if len(filtro_ano) < 2:
+        st.warning("Selecione pelo menos dois anos no menu lateral para comparar.")
+    else:
+        # Agrupar dados por ano
+        comparativo = df.groupby('ano').agg({
+            'id': 'count',
+            'mortos': 'sum',
+            'feridos': 'sum',
+            'veiculos': 'sum'
+        }).rename(columns={
+            'id': 'Total Acidentes',
+            'mortos': 'Mortos',
+            'feridos': 'Feridos',
+            'veiculos': 'Veículos'
+        }).rename_axis("Ano")
+        
+        st.write("**Estatísticas Comparativas**")
+        st.dataframe(comparativo.style.highlight_max(axis=0, color='lightcoral'))
+        
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.write("**Evolução de Acidentes**")
+            st.line_chart(comparativo['Total Acidentes'].rename("Contagem de Acidentes"))
+        with col_c2:
+            st.write("**Evolução de Óbitos**")
+            st.line_chart(comparativo['Mortos'].rename("Contagem de Óbitos"))
+        
+        st.info("💡 A análise comparativa ajuda a identificar tendências de aumento ou redução na segurança viária ao longo dos anos.")
 
 # Rodapé Informativo
 st.sidebar.markdown("---")

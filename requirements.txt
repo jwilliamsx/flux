@@ -1,5 +1,6 @@
-streamlit
+﻿streamlit
 pandas
+sqlite3
 folium
-streamlit_folium
-fpdf2
+streamlit-folium
+requests
